@@ -1,0 +1,61 @@
+# HQ build: an issue labelled `hq-build` becomes a branch with the change on it.
+#
+# How it works: Barend (from his HQ dashboard, or by hand on GitHub) labels an issue `hq-build`.
+#   Barend's own build machine at home (self-hosted runner `homley-build`, CT 210 on Homley) runs Claude Code. It reads
+#   the issue, makes the change on a new hq/... branch off main, checks that the server still builds and its audio tests
+#   pass, pushes the branch and comments a "Create PR" link on the issue. A person opens and merges the pull request,
+#   and the repo's normal ci.yml then runs the full test suite (Postgres via Testcontainers) on GitHub's runners.
+# This workflow never merges and never deploys.
+#
+# There is no Claude or API secret in this repository: Claude runs through the build machine's own login.
+# The build machine refuses any other workflow file or event, has a daily job cap and a kill switch, and is walled
+# off from the network it sits on. Design: bflutz/herbert-homley docs/hq-plan.md, section 13.
+# Project plan: docs/voice-recorder-plan.md (on branch phase1 until merged).
+name: HQ build
+
+on:
+  issues:
+    types: [labeled]
+
+permissions:
+  contents: write        # push the hq/... branch
+  issues: write          # progress comment on the issue
+  pull-requests: read
+
+concurrency:
+  group: hq-build-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    # Only Barend (either of his GitHub logins) may start a build for now (the HQ GitHub App joins this list when it exists).
+    if: github.event.label.name == 'hq-build' && (github.event.sender.login == 'bflutz' || github.event.sender.login == 'BarendL')
+    runs-on: [self-hosted, homley-build]
+    timeout-minutes: 60
+    env:
+      ANTHROPIC_BASE_URL: http://127.0.0.1:9101   # the build machine's own Claude bridge (loopback only)
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+      DOTNET_NOLOGO: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 50
+
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: 10.0.x
+
+      - id: claude
+        uses: anthropics/claude-code-action@ae68417a745a5df4b2124873632bd73a2255e6f6 # v1
+        with:
+          anthropic_api_key: via-homley-bridge     # not a key: the bridge holds the login
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          label_trigger: hq-build
+          base_branch: main
+          branch_prefix: hq/
+          claude_args: |
+            --model claude-opus-5-5
+            --max-turns 150
+            --allowedTools "Bash(dotnet restore:*),Bash(dotnet build:*),Bash(dotnet test:*),Bash(dotnet format:*),Bash(scripts/fetch-speaker-model.sh:*),Bash(scripts/fetch-audio-tagger.sh:*),Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git fetch:*),Bash(ls:*),Bash(cd:*)"
+            --append-system-prompt "You work in Nytka's server (.NET 10, Postgres), forked by Barend for his personal voice recorder: phone records, his home server Homley stores audio and runs this server, his GPU desktop BMain does speech-to-text and the language model over OpenAI-compatible HTTP. Read CLAUDE.md and CONTRIBUTING.md first. The project plan is docs/voice-recorder-plan.md; if it is not on main, read it with: git fetch origin phase1 && git show FETCH_HEAD:docs/voice-recorder-plan.md. Rules: no cloud calls by default, never add secrets, tokens or real recordings, never change .github/, release-please files, LICENSE or NOTICE. Document every new setting in docs/reference/configuration.md and add tests for new behaviour. Before you finish: dotnet build -c Release must pass with no warnings, and dotnet test tests/Nytka.Audio.Tests must pass. The storage/server tests need Docker (Testcontainers), which this machine does not have: write them anyway, try to run the ones that need no database, and say plainly which tests you could not run; GitHub's ci.yml runs them all on the pull request. Keep commits small with clear messages. In your final comment, list what changed, what you checked, and anything you could not do."
